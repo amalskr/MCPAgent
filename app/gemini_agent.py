@@ -36,6 +36,8 @@ def convert_mcp_tools(mcp_tools):
 
 
 
+
+
 async def main():
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
@@ -50,110 +52,168 @@ async def main():
     )
 
     async with stdio_client(server_params) as (read, write):
+        print("DEBUG 1: MCP process started", flush=True)
+
         async with ClientSession(read, write) as session:
-            await session.initialize()
+            print("DEBUG 2: Initializing MCP...", flush=True)
+
+            await asyncio.wait_for(
+                session.initialize(),
+                timeout=15,
+            )
+
+            print("DEBUG 3: MCP initialized successfully", flush=True)
 
             mcp_result = await session.list_tools()
-            declarations = convert_mcp_tools(mcp_result.tools)
 
-            print("Connected to MCP Server!")
+            print(
+                f"DEBUG: Received {len(mcp_result.tools)} MCP tools",
+                flush=True,
+            )
+
+            for tool in mcp_result.tools:
+                print(f"DEBUG TOOL: {tool.name}", flush=True)
+
+            available_tools = {
+                tool.name for tool in mcp_result.tools
+            }
+
+            if not mcp_result.tools:
+                raise RuntimeError(
+                    "No MCP tools received. Check app/server.py tool definitions."
+                )
+
+            gemini_tool = types.Tool(
+                function_declarations=convert_mcp_tools(
+                    mcp_result.tools
+                )
+            )
+
+            print("DEBUG 4: MCP tools loaded", flush=True)
+            print("\n=== SME MySQL AI Agent ===")
             print("Available tools:")
             for tool in mcp_result.tools:
                 print(f"- {tool.name}")
 
-            gemini_tool = types.Tool(
-                function_declarations=declarations
-            )
+            print("\nAsk a question about your business data.")
+            print("Type 'exit' to quit.\n", flush=True)
 
-            question = input("\nAsk your SME Agent: ").strip()
+            history = []
 
-            if not question:
-                print("Please enter a question.")
-                return
+            while True:
+                try:
+                    question = input("You: ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    print("\nGoodbye!")
+                    break
 
-            contents = [
-                types.Content(
-                    role="user",
-                    parts=[
-                        types.Part.from_text(text=question)
-                    ],
-                )
-            ]
+                if not question:
+                    continue
 
-            for _ in range(5):
-                response = await client.aio.models.generate_content(
-                    model=MODEL,
-                    contents=contents,
-                    config=types.GenerateContentConfig(
-                        tools=[gemini_tool],
-                        system_instruction=(
-                            "You are an SME data analyst. "
-                            "Use the available tools to answer questions "
-                            "with real database results. Never invent results. "
-                            "Only use read-only database operations."
-                        ),
-                    ),
+                if question.lower() in {"exit", "quit"}:
+                    print("Goodbye!")
+                    break
+
+                history.append(
+                    types.Content(
+                        role="user",
+                        parts=[
+                            types.Part.from_text(text=question)
+                        ],
+                    )
                 )
 
-                if not response.candidates:
-                    print("Gemini returned no candidates.")
-                    return
+                for round_number in range(5):
+                    try:
+                        response = await client.aio.models.generate_content(
+                            model=MODEL,
+                            contents=history,
+                            config=types.GenerateContentConfig(
+                                tools=[gemini_tool],
+                                system_instruction=(
+                                    "You are an SME data analyst connected to a MySQL database "
+                                    "through MCP tools. "
+                                    "For every question that requires database information, "
+                                    "you MUST call an appropriate MCP tool. "
+                                    "Never merely print or suggest SQL as the final answer. "
+                                    "Use list_tables to list tables, describe_table to inspect "
+                                    "a table, and query_database for read-only SELECT queries. "
+                                    "Only report results returned by the tools. "
+                                    "Never invent database results."
+                                ),
+                            ),
+                        )
+                    except Exception as error:
+                        print(f"\nGemini API error: {error}\n")
+                        break
 
-                model_content = response.candidates[0].content
-                contents.append(model_content)
+                    if not response.candidates:
+                        print("\nGemini returned no response.\n")
+                        break
 
-                function_calls = response.function_calls or []
+                    model_content = response.candidates[0].content
+                    history.append(model_content)
 
-                if not function_calls:
-                    print("\nGemini Response:")
-                    print(response.text or "(No text response)")
-                    return
+                    function_calls = response.function_calls or []
 
-                for function_call in function_calls:
-                    tool_name = function_call.name
-                    arguments = dict(function_call.args or {})
+                    if not function_calls:
+                        print(
+                            "\nAgent: ",
+                            response.text or "(No text response)",
+                            "\n",
+                        )
+                        break
 
-                    available_names = {
-                        tool.name for tool in mcp_result.tools
-                    }
+                    function_responses = []
 
-                    if tool_name not in available_names:
-                        tool_result = {
-                            "error": f"Unknown tool: {tool_name}"
-                        }
-                    else:
-                        print(f"\nCalling MCP tool: {tool_name}")
-                        print(f"Arguments: {arguments}")
+                    for function_call in function_calls:
+                        name = function_call.name
+                        arguments = dict(function_call.args or {})
 
-                        result = await session.call_tool(
-                            tool_name,
-                            arguments,
+                        print(f"[Calling MCP tool: {name}]")
+
+                        if name not in available_tools:
+                            result_data = {
+                                "error": f"Unknown tool: {name}"
+                            }
+                        else:
+                            try:
+                                tool_result = await session.call_tool(
+                                    name,
+                                    arguments,
+                                )
+
+                                result_data = {
+                                    "isError": tool_result.is_error,
+                                    "content": [
+                                        item.text
+                                        if hasattr(item, "text")
+                                        else str(item)
+                                        for item in tool_result.content
+                                    ],
+                                }
+                            except Exception as error:
+                                result_data = {
+                                    "error": str(error)
+                                }
+
+                        function_responses.append(
+                            types.Part.from_function_response(
+                                name=name,
+                                response=result_data,
+                            )
                         )
 
-                        tool_result = {
-                            "isError": result.is_error,
-                            "content": [
-                                {
-                                    "type": item.type,
-                                    "text": getattr(item, "text", ""),
-                                }
-                                for item in result.content
-                            ],
-                        }
-
-                    contents.append(
+                    history.append(
                         types.Content(
                             role="user",
-                            parts=[
-                                types.Part.from_function_response(
-                                    name=tool_name,
-                                    response=tool_result,
-                                )
-                            ],
+                            parts=function_responses,
                         )
                     )
-
-            print("Stopped after 5 tool-calling rounds.")
+                else:
+                    print(
+                        "Agent: Maximum tool-call rounds reached.\n"
+                    )
 
 
 if __name__ == "__main__":
