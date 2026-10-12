@@ -1,3 +1,8 @@
-mcp[cli]
+mcp[cli]>=2.3
 mysql-connector-python
 python-dotenv
+sqlglot
+google-genai
+streamlit>=1.65
+plotly
+pandas
