@@ -6,6 +6,8 @@ import sys
 import mysql.connector
 from dotenv import load_dotenv
 from mcp.server.mcpserver import MCPServer
+import sqlglot
+from sqlglot import exp
 
 load_dotenv()
 
@@ -58,22 +60,81 @@ def describe_table(table_name: str) -> list[dict]:
 
 @mcp.tool()
 def query_database(sql: str) -> list[dict]:
-    """Execute a single read-only SELECT query."""
+    """Execute one read-only SELECT query with a maximum of 1000 rows."""
+
     query = sql.strip()
 
-    if not re.match(r"(?is)^SELECT\b", query):
+    if not query:
+        raise ValueError("SQL query cannot be empty.")
+
+    # Allow one optional trailing semicolon.
+    query = query.rstrip()
+
+    if query.endswith(";"):
+        query = query[:-1].rstrip()
+
+    # Reject internal semicolons and SQL comments.
+    if ";" in query or "--" in query or "/*" in query or "#" in query:
+        raise ValueError(
+            "Multiple statements and SQL comments are not allowed."
+        )
+
+    # Parse SQL using the MySQL dialect.
+    try:
+        statements = sqlglot.parse(query, read="mysql")
+    except Exception as error:
+        raise ValueError("Invalid SQL syntax.") from error
+
+    if len(statements) != 1 or statements[0] is None:
+        raise ValueError("Exactly one SQL statement is required.")
+
+    parsed = statements[0]
+
+    # Allow only SELECT statements.
+    if not isinstance(parsed, exp.Select):
         raise ValueError("Only SELECT queries are allowed.")
 
-    if ";" in query or "--" in query or "/*" in query or "#" in query:
-        raise ValueError("Multiple statements and SQL comments are not allowed.")
+    # Reject SELECT INTO operations.
+    if parsed.find(exp.Into) is not None:
+        raise ValueError("SELECT INTO operations are not allowed.")
+
+    # Apply a default row limit if one was not supplied.
+    MAX_ROWS = 1000
+
+    limit_node = parsed.args.get("limit")
+
+    if limit_node is None:
+        parsed = parsed.limit(MAX_ROWS)
+    else:
+        limit_value = limit_node.expression
+
+        if not isinstance(limit_value, exp.Literal):
+            raise ValueError("LIMIT must be a fixed integer.")
+
+        if limit_value.is_string:
+            raise ValueError("LIMIT must be an integer.")
+
+        try:
+            requested_limit = int(limit_value.this)
+        except (TypeError, ValueError):
+            raise ValueError("LIMIT must be an integer.")
+
+        if requested_limit < 1:
+            raise ValueError("LIMIT must be at least 1.")
+
+        if requested_limit > MAX_ROWS:
+            parsed = parsed.limit(MAX_ROWS)
+
+    safe_query = parsed.sql(dialect="mysql")
 
     connection = get_connection()
     try:
         cursor = connection.cursor(dictionary=True)
-        cursor.execute(query)
+        cursor.execute(safe_query)
         return cursor.fetchall()
     finally:
         connection.close()
+
 
 
 if __name__ == "__main__":
